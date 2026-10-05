@@ -1,0 +1,7 @@
+MediaPipe Tasks Vision 1.0.1 - Apache License 2.0
+https://github.com/google-ai-edge/mediapipe
+Models (hand_landmarker.task, gesture_recognizer.task) - Apache License 2.0, Google
+
+MODIFIED (HAND SCULPTOR, 2026-10-04): vision_bundle.mjs and vision_bundle.js have the built-in usage logger
+disabled (the logger constructor sets an error instead of starting its 60 s flush timer), so no usage data is
+sent to odml.pa.googleapis.com. Everything else is the unmodified npm @mediapipe/tasks-vision 1.0.1 build.
