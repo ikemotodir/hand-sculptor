@@ -82,6 +82,12 @@ addStrings({ ja: {
   'attract.go': 'てを かざしてね', 'attract.sub': 'さわって つくる 3D',
   'hint.closer': 'もっと ちかくに', 'hint.bright': 'あかるい ばしょで', 'hint.pickFirst': '☝️で えらんでね',
   'hint.short': 'ひくい まど→よこで とるよ',
+  // tracker health (R4): one extra line on the status card. 'ok' shows nothing. The short code is for Claude.
+  'st.retrying': '手の認識を 切りかえ中', 'st.fatal': '手の認識が うごきません',
+  // 診断 panel (せってい → 診断): plain text the owner can read out or copy
+  'set.diag': '診断', 'diag.title': '診断', 'diag.copy': 'コピー', 'diag.copied': 'コピーしました', 'diag.none': 'まだ データなし',
+  'diag.engine': 'ブラウザ', 'diag.path': '経路', 'diag.rate': '結果/秒', 'diag.cam': 'カメラ', 'diag.screen': '画面',
+  'diag.errors': 'エラー', 'diag.state': '状態', 'diag.ver': '版',
 }});
 
 const SHAPES = ['random', 'box', 'sphere', 'cylinder', 'cone', 'torus', 'octa', 'pyramid', 'icosa', 'star', 'heart'];
@@ -175,6 +181,57 @@ export function fitPop(w, h, r, anchorTop, side = 'right') {
   if (w > r.x1 - r.x0 + 0.5 || h > r.y1 - r.y0 + 0.5) return null;
   return { x: side === 'left' ? r.x0 : r.x1 - w, y: clamp(anchorTop, r.y0, r.y1 - h) };
 }
+/**
+ * Tracker health line on the status card (R4). state = 'ok' | 'retrying' | 'fatal' (tracker.on('status') {state, code}).
+ * 'ok' shows nothing; 'retrying' one line; 'fatal' the line + the short code (e.g. W-BM-black) in mono so the
+ * owner can read it to Claude. Anything unknown is treated as 'ok' (never a stale warning). → {show, key, code}
+ */
+export function healthView(state = 'ok', code = '') {
+  if (state === 'retrying') return { show: true, key: 'st.retrying', code: '' };
+  if (state === 'fatal') return { show: true, key: 'st.fatal', code: String(code || '').slice(0, 24) };
+  return { show: false, key: '', code: '' };
+}
+const IN_APP_UA = /Instagram|FBAN|FBAV|Line\/|BytedanceWebview|musical_ly/i;
+/**
+ * Browser + major version + device from a UA string, for the 診断 panel: 'Safari 18 / iPhone', 'Chrome 140 / Windows',
+ * 'Chrome iOS 140 / iPhone'. iPadOS sends a Mac UA: touch > 1 on a Mac → iPad. In-app browsers get ' app'.
+ */
+export function engineName(ua = '', touch = 0) {
+  const major = re => { const r = re.exec(ua); return r ? r[1].split('.')[0] : null; };
+  let name = null, ver = null;
+  if ((ver = major(/Edg(?:e|iOS|A)?\/([\d.]+)/))) name = 'Edge';
+  else if ((ver = major(/CriOS\/([\d.]+)/))) name = 'Chrome iOS';
+  else if ((ver = major(/FxiOS\/([\d.]+)/))) name = 'Firefox iOS';
+  else if ((ver = major(/Firefox\/([\d.]+)/))) name = 'Firefox';
+  else if ((ver = major(/(?:Chrome|Chromium)\/([\d.]+)/))) name = 'Chrome';
+  else if (/Safari\//.test(ua) && (ver = major(/Version\/([\d.]+)/))) name = 'Safari';
+  else if (/AppleWebKit/.test(ua)) { name = 'WebKit'; ver = major(/OS (\d+)_/) || '?'; }
+  else return ua ? 'unknown' : '-';
+  const os = /iPhone/.test(ua) ? 'iPhone' : /iPad/.test(ua) || (/Macintosh/.test(ua) && touch > 1) ? 'iPad'
+    : /Android/.test(ua) ? 'Android' : /Windows/.test(ua) ? 'Windows' : /Macintosh/.test(ua) ? 'Mac' : /CrOS/.test(ua) ? 'ChromeOS' : /Linux/.test(ua) ? 'Linux' : '';
+  return `${name} ${ver}${os ? ' / ' + os : ''}${IN_APP_UA.test(ua) ? ' app' : ''}`;
+}
+/**
+ * 診断 rows from the raw numbers (main.js provider + the HUD's own environment). Every value is a short string;
+ * missing → '-'. path = the tracker's strategy code (metrics().strategyCode, e.g. W-BM) + worker|main / frame source / GPU|CPU.
+ * → [[labelKey, value]]
+ */
+export function diagLines(d = {}) {
+  const s = x => (x == null || x === '' ? '-' : String(x));
+  const path = [d.strategy, [d.worker == null ? null : d.worker ? 'worker' : 'main', d.frameSource, d.delegate].filter(Boolean).join('/')].filter(Boolean).join(' ') || '-';
+  const cam = d.vw > 0 && d.vh > 0 ? `${d.vw}x${d.vh}` + (d.camFps > 0 ? `@${Math.round(d.camFps)}` : '') : '-';
+  const screen = d.screenW > 0 ? `${d.screenW}x${d.screenH}` + (d.dpr > 0 ? ` x${(+d.dpr).toFixed(2).replace(/\.?0+$/, '')}` : '') : '-';
+  const state = d.health ? d.health + (d.code ? ' ' + d.code : '') : '-';
+  return [
+    ['diag.engine', s(d.engine)], ['diag.path', path],
+    ['diag.rate', d.resultRate != null && isFinite(d.resultRate) ? (+d.resultRate).toFixed(1) : '-'],
+    ['diag.cam', cam], ['diag.screen', screen], ['diag.errors', s(d.errors ?? 0)], ['diag.state', state], ['diag.ver', s(d.version)],
+  ];
+}
+/** The 診断 rows as plain text for the clipboard: 'HAND SCULPTOR' + one 'label: value' per line. */
+export function diagText(lines, tr = k => k) {
+  return ['HAND SCULPTOR', ...lines.map(([k, v]) => `${tr(k)}: ${v}`)].join('\n');
+}
 
 /**
  * @param {{root: HTMLElement, onAction: (name:string, payload?:any)=>void, assetBase?: string, colors?: string[], shapes?: string[]}} o
@@ -197,7 +254,7 @@ export function createHud({ root, onAction = () => {}, assetBase = './', colors 
   root.innerHTML = `
   <div class="hs-status glass" id="hud-status">
     <div class="hs-brand">HAND SCULPTOR</div>
-    <div class="hs-st"><i class="dot"></i><span class="st-text"></span><em class="cap st-cap"></em></div>
+    <div class="hs-st"><i class="dot"></i><span class="st-text"></span><span class="hs-health" id="hud-health" hidden><span class="ht"></span><code class="hc" hidden></code></span><em class="cap st-cap"></em></div>
     <div class="hs-pose" id="hud-pose" hidden></div>
   </div>
   <div class="hs-toast" id="hud-toast" role="status" aria-live="polite"></div>
@@ -293,6 +350,18 @@ export function createHud({ root, onAction = () => {}, assetBase = './', colors 
     </div>
   </div>
 
+  <div class="hs-modal" id="hud-diag" hidden>
+    <div class="sheet glass diag">
+      <div class="ph"><span data-i18n="diag.title"></span><em class="cap">DIAGNOSTICS</em>
+        <button class="x" id="diag-close" data-dwell aria-label="close">${ICONS.close}</button></div>
+      <div class="diag-body" id="diag-body"></div>
+      <div class="diag-actions">
+        <button class="hs-btn pri" id="diag-copy" data-real>${ICONS.copy}<span data-i18n="diag.copy"></span></button>
+        <button class="hs-btn" id="diag-x" data-dwell>${ICONS.close}<span data-i18n="tray.close"></span></button>
+      </div>
+    </div>
+  </div>
+
   <div class="hs-attract" id="hud-attract" hidden>
     <div class="cube3d"><i></i><i></i><i></i><i></i><i></i><i></i></div>
     <div class="at-t" data-i18n="attract.go"></div>
@@ -306,7 +375,8 @@ export function createHud({ root, onAction = () => {}, assetBase = './', colors 
     toast: $('hud-toast'), hints: $('hud-hints'), rec: $('hud-rec'), count: $('hud-count'), countdown: $('hud-countdown'), flash: $('hud-flash'),
     guide: $('hud-guide'), tray: $('hud-tray'), tb: $('hud-toolbar'), tbItems: root.querySelector('.tb-items'),
     pops: { shape: $('pop-shape'), color: $('pop-color'), menu: $('pop-menu') }, menuGrid: $('menu-grid'),
-    link: $('hud-link'), sheet: $('hud-sheet'), license: $('hud-license'), attract: $('hud-attract'),
+    link: $('hud-link'), sheet: $('hud-sheet'), license: $('hud-license'), diag: $('hud-diag'), attract: $('hud-attract'),
+    health: $('hud-health'),
   };
 
   // ── i18n ───────────────────────────────────────────────────────────────
@@ -404,7 +474,7 @@ export function createHud({ root, onAction = () => {}, assetBase = './', colors 
   }
   /** Keep the toolbar ≥ 1.5·palmPx from the edge (hand-reachable). Never moves mid-reach (see createInsetTracker). */
   function setHandScale(palmPx, now = performance.now()) {
-    const busy = !!dwellEl || !!openPanel || !els.sheet.hidden || !els.license.hidden;
+    const busy = !!dwellEl || !!openPanel || !els.sheet.hidden || !els.license.hidden || !els.diag.hidden;
     const next = insetTracker.update(palmPx, now, busy);
     if (next == null) return;
     inset = next; layout();
@@ -429,6 +499,17 @@ export function createHud({ root, onAction = () => {}, assetBase = './', colors 
       }
       e.classList.toggle('pop-under', on);
     }
+    // the ? button too (R4: 17 settings tiles = 5 rows at 1280x560 in the 縦 frame reach it; the pop-up's ✕ closes it).
+    // Closed guide: the whole block goes; open beside the frame (guide-out): only the button, the guide stays readable.
+    const gt = $('guide-toggle');
+    let gon = false;
+    if (r && gt.offsetWidth) {
+      const q = gt.getBoundingClientRect();
+      gon = Math.min(q.right, r.right) - Math.max(q.left, r.left) > 1 && Math.min(q.bottom, r.bottom) - Math.max(q.top, r.top) > 1;
+    }
+    const openG = els.guide.classList.contains('open');
+    els.guide.classList.toggle('pop-under', gon && !openG);
+    gt.classList.toggle('pop-under', gon && openG);
     rectsDirty = true;
   }
   const framedNow = () => { const F = root.getBoundingClientRect(); return F.width < innerWidth - 1 || F.height < innerHeight - 1; };
@@ -592,6 +673,7 @@ export function createHud({ root, onAction = () => {}, assetBase = './', colors 
     { id: 'side', val: () => t('v.' + settings.side), act: () => cycle('side', ['right', 'left']), show: () => !mobile },   // phones: bottom bar, nothing moves
     { id: 'tutorial', act: () => { setPanel(null); act('tutorial'); } },
     { id: 'link', act: () => { setPanel(null); openLink(true); }, show: () => !!linkInfo && !settings.kiosk },
+    { id: 'diag', act: () => { setPanel(null); openDiag(); }, cap: 'INFO' },
     { id: 'license', act: () => { setPanel(null); openLicense(); } },
   ];
   function toggle(k) { settings[k] = !settings[k]; renderMenu(); act(k, settings[k]); }
@@ -624,6 +706,19 @@ export function createHud({ root, onAction = () => {}, assetBase = './', colors 
   function setTracking(state, n = 0) {
     if (state === trackState && n === handsCount) return;
     trackState = state; handsCount = n; renderStatus();
+  }
+  /** Tracker health (R4): 'ok' | 'retrying' | 'fatal' (+ short code) from tracker.on('status'). Extra line on the card. */
+  let health = { state: 'ok', code: '' };
+  function setHealth(state = 'ok', code = '') {
+    const v = healthView(state, code);
+    health = { state: v.show ? state : 'ok', code: v.code };
+    els.health.hidden = !v.show;
+    els.status.classList.toggle('has-health', v.show);
+    if (v.show) els.status.dataset.health = health.state; else delete els.status.dataset.health;
+    els.health.querySelector('.ht').textContent = v.show ? t(v.key) : '';
+    const c = els.health.querySelector('.hc'); c.hidden = !v.code; c.textContent = v.code;
+    rectsDirty = true;
+    if (!els.diag.hidden) renderDiag();
   }
   let lastPose = null;
   function setPose(pose) {
@@ -828,10 +923,53 @@ export function createHud({ root, onAction = () => {}, assetBase = './', colors 
   function closeLicense() { els.license.hidden = true; rectsDirty = true; }
   on('lic-close', closeLicense);
   els.license.addEventListener('click', e => { if (e.target === els.license) closeLicense(); });
-  // Esc closes an open license / sheet first, and nothing else on that key press (R2-8)
+
+  // ── 診断 panel (R4): engine / path / results per second / camera / screen / errors / state, + コピー ──────
+  // main.js gives the tracker-side numbers through setDiagProvider(); the HUD adds the browser, screen and health.
+  let diagProvider = null, diagTimer = 0, diagRows = [];
+  function setDiagProvider(fn) { diagProvider = typeof fn === 'function' ? fn : null; if (!els.diag.hidden) renderDiag(); }
+  function diagInfo() {
+    let d = {};
+    try { d = (diagProvider && diagProvider()) || {}; } catch (e) { console.warn('[hud] diag', e); }
+    return {
+      engine: engineName(typeof navigator !== 'undefined' ? navigator.userAgent || '' : '', typeof navigator !== 'undefined' ? navigator.maxTouchPoints || 0 : 0),
+      screenW: innerWidth, screenH: innerHeight, dpr: devicePixelRatio || 1, health: health.state, code: health.code, ...d,
+    };
+  }
+  function renderDiag() {
+    diagRows = diagLines(diagInfo());
+    $('diag-body').innerHTML = diagRows.map(([k, v]) => `<div class="dk">${esc(t(k))}</div><div class="dv">${esc(v)}</div>`).join('');
+  }
+  function openDiag() {
+    renderDiag();
+    els.diag.hidden = false; rectsDirty = true;
+    clearInterval(diagTimer); diagTimer = setInterval(() => { if (els.diag.hidden) clearInterval(diagTimer); else renderDiag(); }, 1000);
+  }
+  function closeDiag() { els.diag.hidden = true; clearInterval(diagTimer); diagTimer = 0; rectsDirty = true; }
+  /** Copy the rows as text. A REAL tap only (clipboard needs user activation); textarea fallback for old WebKit. */
+  async function copyDiag(e) {
+    if (!e?.isTrusted && !e?.__hsTest) return;
+    const text = diagText(diagRows.length ? diagRows : diagLines(diagInfo()), t);
+    let ok = false;
+    try { await navigator.clipboard.writeText(text); ok = true; } catch {
+      try {
+        const ta = document.createElement('textarea'); ta.value = text; ta.style.cssText = 'position:fixed;opacity:0';
+        document.body.appendChild(ta); ta.select(); ok = document.execCommand('copy'); ta.remove();
+      } catch { /* ignore */ }
+    }
+    const s = $('diag-copy').querySelector('span');
+    s.textContent = t(ok ? 'diag.copied' : 'diag.copy');
+    if (ok) setTimeout(() => { s.textContent = t('diag.copy'); }, 2000);
+    return ok;
+  }
+  on('diag-close', closeDiag); on('diag-x', closeDiag);
+  on('diag-copy', e => copyDiag(e));
+  els.diag.addEventListener('click', e => { if (e.target === els.diag) closeDiag(); });
+
+  // Esc closes an open license / 診断 / sheet first, and nothing else on that key press (R2-8)
   document.addEventListener('keydown', e => {
     if (e.key !== 'Escape') return;
-    if (!els.license.hidden) closeLicense(); else if (!els.sheet.hidden) closeSheet(); else return;
+    if (!els.license.hidden) closeLicense(); else if (!els.diag.hidden) closeDiag(); else if (!els.sheet.hidden) closeSheet(); else return;
     e.stopPropagation();
   }, true);
 
@@ -902,7 +1040,7 @@ export function createHud({ root, onAction = () => {}, assetBase = './', colors 
   function hitTest(sx, sy) {
     const list = collect(performance.now());
     const slop = UI.dwellSlopPx;
-    const modal = [els.sheet, els.license].find(m => !m.hidden);
+    const modal = [els.sheet, els.license, els.diag].find(m => !m.hidden);
     let best = null, bestD = Infinity;
     for (const { id, r } of list) {
       const el = document.getElementById(id);
@@ -941,11 +1079,12 @@ export function createHud({ root, onAction = () => {}, assetBase = './', colors 
 
   return {
     root, settings, style,
-    setTracking, setPose, toast, setCount, setStyle, setMode, setSelected, setCanUndo,
+    setTracking, setHealth, setPose, toast, setCount, setStyle, setMode, setSelected, setCanUndo,
     hitTest, setDwell, activate, setRecording, countdown, flash,
     showLink, setLinkState, openLink, getLinkSlot: () => $('link-slot'),
     setSettings, applyLang, setHandScale, hint, setHint, setAttract, setGuide, setPanel,
     addTrayItem, removeTrayItem, clearTray, openSheet, closeSheet, openLicense,
+    setDiagProvider, openDiag, closeDiag, copyDiag, get health() { return { ...health }; },
     get mobile() { return mobile; }, get openPanel() { return openPanel; }, layout,
   };
 }

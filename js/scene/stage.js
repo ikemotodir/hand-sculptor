@@ -6,9 +6,13 @@
 // Image quality (2026-10-05): the camera image is always drawn at the full device pixel ratio (cap 2). 低 / the auto
 // drop save GPU time on the holograms only (no bloom, no MSAA), never by lowering the camera resolution.
 // くっきり (setClarity): a light halo-free unsharp mask + slight contrast/saturation lift for cheap webcams.
+// denoise (setDenoise, 2026-10-08): before the composite, each NEW camera frame is blended with the previous denoised
+// frame (ping-pong render targets at camera resolution) where nothing moved; moving pixels keep the current frame
+// (no ghosting). くっきり then sharpens the clean image. Captures read the canvas, so they get the same output.
 import * as THREE from 'three';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { FullScreenQuad } from 'three/addons/postprocessing/Pass.js';
 
 const BLOOM_LAYER = 1;
 
@@ -71,6 +75,49 @@ const CompositeShader = {
       #endif
     }`,
 };
+
+// Motion-adaptive temporal denoise (camera values, sRGB-encoded, camera resolution). d = per-channel max |cur - prev|
+// of the pixel, or the mean of its 4 neighbours, whichever is larger; weight = uStrength where d <= uLo, 0 where
+// d >= uHi (smoothstep between), 0 on the first frame (no history). Output = mix(cur, prev, weight). Same
+// orientation convention as the camera texture (flipY = false).
+const DenoiseShader = {
+  name: 'HSVideoDenoise',
+  uniforms: {
+    tCur: { value: null }, tPrev: { value: null },
+    uTexel: { value: null }, uHistory: { value: 0 }, uStrength: { value: 0.65 }, uLo: { value: 0.03 }, uHi: { value: 0.10 },
+  },
+  vertexShader: /* glsl */`
+    varying vec2 vUv;
+    void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+  fragmentShader: /* glsl */`
+    uniform sampler2D tCur, tPrev;
+    uniform vec2 uTexel;
+    uniform float uHistory, uStrength, uLo, uHi;
+    varying vec2 vUv;
+    float d3(vec2 uv) { vec3 a = abs(texture2D(tCur, uv).rgb - texture2D(tPrev, uv).rgb); return max(a.r, max(a.g, a.b)); }
+    void main() {
+      vec3 cur = texture2D(tCur, vUv).rgb;
+      if (uHistory < 0.5) { gl_FragColor = vec4(cur, 1.0); return; }
+      vec3 prev = texture2D(tPrev, vUv).rgb;
+      // the pixel's own difference, or the mean of its 4 neighbours (noise-resistant), whichever says "moved" more:
+      // a thin moving edge whose neighbours stand still is never blended either
+      float d = max(d3(vUv), 0.25 * (d3(vUv + vec2(uTexel.x, 0.0)) + d3(vUv - vec2(uTexel.x, 0.0)) + d3(vUv + vec2(0.0, uTexel.y)) + d3(vUv - vec2(0.0, uTexel.y))));
+      float w = uStrength * (1.0 - smoothstep(uLo, uHi, d));
+      gl_FragColor = vec4(mix(cur, prev, w), 1.0);
+    }`,
+};
+
+/** JS mirror of the shader's blend weight (unit tests): d = motion difference 0-1 → weight of the previous frame */
+export function denoiseWeight(d, strength = 0.65, lo = 0.03, hi = 0.10, history = true) {
+  if (!history) return 0;
+  const t = Math.min(1, Math.max(0, (d - lo) / Math.max(1e-9, hi - lo)));
+  return strength * (1 - t * t * (3 - 2 * t));
+}
+/** denoise default for this device from RENDER.composite.denoise ({enabled, mobile}) */
+export function denoiseDefault(cfg, mobile) {
+  if (!cfg || cfg.enabled === false) return false;
+  return mobile ? cfg.mobile === true : true;
+}
 
 function detectMobile() {
   try {
@@ -159,6 +206,43 @@ export function createStage({ canvas, video = null, config, mobile, forcePipelin
     cu.uSat.value = clarityOn ? (C.saturation ?? 1.06) : 1;
   }
   setClarity(R.composite?.clarity !== false);
+
+  // --- temporal denoise (see top). Runs once per new camera frame into a ping-pong pair at camera resolution.
+  const DN = R.composite?.denoise || {};
+  const dnMat = new THREE.ShaderMaterial({ uniforms: THREE.UniformsUtils.clone(DenoiseShader.uniforms), vertexShader: DenoiseShader.vertexShader, fragmentShader: DenoiseShader.fragmentShader, depthTest: false, depthWrite: false });
+  const du = dnMat.uniforms;
+  du.uTexel.value = new THREE.Vector2(1 / 1280, 1 / 720);
+  du.uStrength.value = DN.strength ?? 0.65; du.uLo.value = DN.lo ?? 0.03; du.uHi.value = DN.hi ?? 0.10;
+  const dnQuad = new FullScreenQuad(dnMat);
+  let dnRT = null, dnW = 0, dnH = 0, dnWrite = 0, dnHistory = 0, dnKey = null, dnSrc = null, dnFrames = 0;
+  let denoiseOn = denoiseDefault(DN, isMobile);
+  function setDenoise(on) { denoiseOn = !!on; if (!denoiseOn) dnHistory = 0; }
+  function dnTargets(w, h) {
+    if (dnRT && dnW === w && dnH === h) return dnRT;
+    if (dnRT) dnRT.forEach(t => t.dispose());
+    const mk = () => { const t = new THREE.WebGLRenderTarget(w, h, { type: THREE.UnsignedByteType, depthBuffer: false, stencilBuffer: false, generateMipmaps: false, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter }); t.texture.colorSpace = THREE.NoColorSpace; return t; };
+    dnRT = [mk(), mk()]; dnW = w; dnH = h; dnHistory = 0; dnWrite = 0;
+    du.uTexel.value.set(1 / w, 1 / h);
+    return dnRT;
+  }
+  /** new camera content? frames fed by setFrame → texture version; the live VideoTexture → video.currentTime */
+  function frameKey(tex) { return tex === videoTex && video ? 'v' + video.currentTime : 't' + tex.version; }
+  function runDenoise() {
+    if (!denoiseOn || !(cu.uHasVideo.value > 0.5) || lost) return;
+    const src = cu.tVideo.value;
+    if (!src || !vw || !vh) return;
+    const rts = dnTargets(vw, vh);
+    const key = frameKey(src);
+    if (src === dnSrc && key === dnKey && dnHistory) { cu.tVideo.value = rts[1 - dnWrite].texture; return; }   // same frame: show the last result
+    dnSrc = src; dnKey = key;
+    du.tCur.value = src; du.tPrev.value = rts[1 - dnWrite].texture; du.uHistory.value = dnHistory;
+    const prevRT = renderer.getRenderTarget();
+    renderer.setRenderTarget(rts[dnWrite]);      // a render target → three's effects chain does not run here
+    dnQuad.render(renderer);
+    renderer.setRenderTarget(prevRT);
+    cu.tVideo.value = rts[dnWrite].texture;
+    dnWrite = 1 - dnWrite; dnHistory = 1; dnFrames++;
+  }
 
   // 低 = no MSAA (R 2026-10-05). The built-in effects path keeps its multisampled scene target private: it is the
   // one target three binds with samples > 0 + a depth buffer during a render; found on the first render, then its
@@ -401,6 +485,7 @@ export function createStage({ canvas, video = null, config, mobile, forcePipelin
       videoTex = null; makeVideoTexture();
     }
     if (frameTex) { frameTex = null; frameTexW = frameTexH = 0; }
+    dnRT = null; dnW = dnH = 0; dnHistory = 0; dnKey = null; dnSrc = null;   // died with the context: rebuilt on the next render
     sceneRT = null; probing = useEffects;   // three made new targets: find the scene target again
     applyQuality();
     resize(W, H, dpr);
@@ -414,10 +499,11 @@ export function createStage({ canvas, video = null, config, mobile, forcePipelin
   // --- render
   function render(dt = 1 / 60) {
     if (lost) return;
+    const now = performance.now();   // before the capture resize: a slow resize must not age the synced frame into the live fallback
     if (capApplied !== capH) { capApplied = capH; resize(W, H, dpr); }
-    const now = performance.now();
     uploadPending();
     pickBackground(now);
+    runDenoise();
     if (useEffects && !sceneRT) probing = true;
     if (composer) composer.render(dt);
     else renderer.render(scene, camera);
@@ -439,6 +525,7 @@ export function createStage({ canvas, video = null, config, mobile, forcePipelin
     if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVis);
     safeClose(curFrame); safeClose(pendingFrame);
     videoTex?.dispose(); frameTex?.dispose();
+    if (dnRT) dnRT.forEach(t => t.dispose()); dnQuad.dispose(); dnMat.dispose();
     bloomPass.dispose(); compositePass.dispose();
     renderer.dispose();
   }
@@ -457,6 +544,10 @@ export function createStage({ canvas, video = null, config, mobile, forcePipelin
     setCaptureHeight, bufferHeight,
     /** くっきり on/off (camera image only) */
     setClarity, getClarity: () => clarityOn,
+    /** temporal denoise on/off (camera image only; default: desktop on, mobile off — RENDER.composite.denoise) */
+    setDenoise, getDenoise: () => denoiseOn,
+    /** for tests: how many camera frames went through the denoise pass and the pass size */
+    denoiseInfo: () => ({ on: denoiseOn, frames: dnFrames, size: dnRT ? [dnW, dnH] : null, history: !!dnHistory }),
     /** the camera's own resolution (not a downscaled frame copy): capture.js sizes photos / videos from it */
     getCameraSize: () => (video?.videoWidth ? { w: video.videoWidth, h: video.videoHeight } : (vw && vh ? { w: vw, h: vh } : null)),
     /** MSAA samples of the scene target (null until the first render / composer path) */

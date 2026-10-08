@@ -26,7 +26,9 @@ addStrings({ ja: {
   'err.insecure': 'この開き方では 使えません', 'err.insecure.d': 'https で 開いてね',
   'err.file': 'ファイルを 直接 開いています', 'err.file.d': 'アイコンから 開いてね',
   'err.inapp': 'ここでは カメラが 使えません', 'err.inapp.d': 'Safari か Chrome で 開いてね',
-  'err.unsupported': 'ブラウザを 最新にしてね', 'err.unsupported.d': '最新の Chrome か Safari で',
+  // R4: accurate — importmap / WebGL2 / getUserMedia missing means THIS browser (in-app view, old engine) cannot run it.
+  // Never 「最新にしてね」: an up-to-date phone can land here (LINE/Instagram view), and the advice would be wrong.
+  'err.unsupported': 'このブラウザでは 動きません', 'err.unsupported.d': 'Safari か Chrome で ひらいてね',
   'err.model': 'よみこみに 失敗しました', 'err.model.d': '通信を 確認して もう一度',
   'err.unknown': 'カメラを 開けませんでした', 'err.unknown.d': 'もう一度 試してね',
 }});
@@ -136,7 +138,7 @@ export function showStart({ root, onLaunch = async () => {}, onNoCamera = () => 
     busy = false; btn.disabled = false; btn.querySelector('.lb').textContent = t('start.go');
     hidden = false; root.hidden = false; root.classList.remove('out');
     $('st-err-t').textContent = t('err.' + code);
-    const copy = code === 'inapp' || code === 'file' || code === 'insecure';
+    const copy = code === 'inapp' || code === 'file' || code === 'insecure' || code === 'unsupported';   // URL → open it elsewhere
     errBox.hidden = false; errBox.dataset.code = code;
     $('st-retry').hidden = NO_RETRY.has(code);
     if (code === 'NotAllowedError') setBlocked(camBlockedKey(camEnv()));

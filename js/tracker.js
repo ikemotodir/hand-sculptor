@@ -22,14 +22,30 @@
 //             interval) late with the hands interpolated to exactly that frame → smooth video at camera fps and
 //             the skeleton stays on the hand (owner bug #20). Back to 'sync' above ~24/s (hysteresis + dwell).
 //   'live'    only when no frames can be kept (videoFrames 'none'): live VideoTexture.
-// Rendering never waits for detection. Any worker failure or a detect unanswered for too long → the original
-// main-thread path below.
+// Rendering never waits for detection.
+//
+// SELF-HEALING CHAIN (2026-10-08, tracker-sync.js strategyPlan/HealthCheck): strategies a (worker + VideoFrame),
+// b (worker + ImageBitmap from a 2D canvas), c (main thread + the <video> element itself) are tried in order; each
+// must deliver ≥ 3 results within 4 s of camera frames flowing, on frames that are not black, or the next one is
+// started (camera stream kept). iOS/Safari start at b with the CPU delegate. After the last one: status 'fatal'
+// with a reason code (e.g. W-VF-timeout, W-BM-black, M-VID-error) — the camera stays on screen.
 import { CONFIG } from './config.js';
-import { FrameModeCtl, FRAME_SYNC_DEFAULTS, pickPresentation, workerStalled, RollingMedian, ringPlan, ringCapFor, mainStartIdx, CameraRetry } from './tracker-sync.js';
+import { FrameModeCtl, FRAME_SYNC_DEFAULTS, pickPresentation, workerStalled, RollingMedian, ringPlan, ringCapFor, mainStartIdx, CameraRetry,
+  STRATEGIES, strategyPlan, appleBrowser, HealthCheck, meanLum, cameraTune } from './tracker-sync.js';
+import { DEV_HOSTS } from './devcfg.js';
 
 const TC = () => CONFIG.media.tracker;
 const CC = () => CONFIG.media.camera;
 const CORE_T = () => CONFIG.core?.tracker || {};
+
+/** ?fakevideo=name (letters, digits, . _ -) on a dev host → file name, else null */
+export function devFakeVideo(loc = typeof location !== 'undefined' ? location : null) {
+  try {
+    if (!loc || !DEV_HOSTS.has(loc.hostname)) return null;
+    const v = new URLSearchParams(loc.search).get('fakevideo');
+    return v && /^[\w.-]+$/.test(v) && !/^\.+$/.test(v) ? v : null;
+  } catch (e) { return null; }
+}
 
 export function isMobileDevice() {
   if (typeof navigator === 'undefined') return false;
@@ -115,6 +131,10 @@ export function precacheHint(files, nav = typeof navigator !== 'undefined' ? nav
 export async function createTracker(o = {}) {
   const { video } = o;
   const mobile = o.mobile ?? isMobileDevice();
+  const apple = o.apple ?? appleBrowser(typeof navigator !== 'undefined' ? navigator.userAgent || '' : '');
+  // Test hook (localhost only): ?fakevideo=<file under /tools/data/> plays that file in the <video> instead of the
+  // camera, so detection runs on engines without Chrome's fake-camera flags (Playwright WebKit, …).
+  const fakeVideo = o.fakeVideo ?? devFakeVideo();
   const pageBase = typeof document !== 'undefined' ? document.baseURI : location.href;
   const base = o.assetBase ? new URL(o.assetBase, pageBase).href : pageBase;
   const url = p => new URL(p, base).href;
@@ -168,8 +188,15 @@ export async function createTracker(o = {}) {
   const modeCtl = new FrameModeCtl(SY);
   const resultTimes = [], videoTimes = [], presentTimes = [];
   let gpuCheck = { state: 'n/a' };
+  // self-healing chain: plan = ordered strategy keys; strat = the current one; tried = reason codes so far
+  const HC = { windowMs: 4000, firstMs: { GPU: 12000, CPU: 6000 }, minResults: 3, lumSamples: 3, blackLum: 8, lumAfterMs: 500, ...(TC().health || {}) };
+  const health = new HealthCheck(HC);
+  let plan = [], stratIdx = 0, strat = null, switching = null;
+  const tried = [];
+  let healthState = 'pending', healthCode = null;   // 'pending' | 'ok' | 'retrying' | 'fatal'
+  let capCv = null, capCtx = null;                  // strategy b: 2D canvas the camera frame is drawn into
   // leak ledger: every frame handed out (display) or buffered (ring) has a counting close()
-  const ledger = { made: 0, displayMade: 0, displayClosedEarly: 0, workerClosed: 0, ringMade: 0, closedCounted: 0 };
+  const ledger = { made: 0, displayMade: 0, displayClosedEarly: 0, workerClosed: 0, ringMade: 0, closedCounted: 0, workerClosedBase: 0, workerClosedCur: 0 };
   const displaySet = new Set(), ringSet = new Set();
   // delayed mode: buffered camera frames {mt, wall, frame} and recent results {mt, hands, vw, vh} (ascending mt)
   const ring = [], hist = [];
@@ -285,6 +312,13 @@ export async function createTracker(o = {}) {
   // ---- camera -------------------------------------------------------------------------------------------
   function constraints() {
     const c = CC();
+    if (apple) {
+      // iOS/Safari: the only request (no applyConstraints later) → ask the max at once, in the screen's orientation
+      const L = c.mobileMaxLong || 1920, S = c.mobileMaxShort || 1080;
+      const tall = portrait || (typeof innerWidth === 'number' && innerHeight > innerWidth);
+      const v = { facingMode: facing, width: { ideal: tall ? S : L }, height: { ideal: tall ? L : S }, frameRate: { ideal: c.frameRate }, aspectRatio: { ideal: tall ? S / L : L / S } };
+      return { video: v, audio: false };
+    }
     const W = portrait ? c.portraitWidth : c.width, H = portrait ? c.portraitHeight : c.height;
     const v = { facingMode: facing, width: { ideal: W }, height: { ideal: H }, frameRate: { ideal: c.frameRate } };
     if (typeof innerWidth === 'number' && innerHeight > 0) v.aspectRatio = { ideal: portrait ? 9 / 16 : innerWidth / innerHeight };
@@ -307,6 +341,7 @@ export async function createTracker(o = {}) {
     try {
       const caps = track?.getCapabilities?.() || {};
       info.capW = caps.width?.max || 0; info.capH = caps.height?.max || 0; info.capFps = Math.round(caps.frameRate?.max || 0);
+      if (apple && c.upgradeApple !== true) { info.upgrade = 'skipped-apple'; return info; }   // never mid-stream on iOS/Safari
       if (c.upgrade === false || !track?.applyConstraints || !info.capW || !info.capH || !set0.width || !set0.height) return info;
       const mob = isMobileDevice();
       const L = (mob ? c.mobileMaxLong : c.maxLong) || 1920, S = (mob ? c.mobileMaxShort : c.maxShort) || 1080;
@@ -344,6 +379,30 @@ export async function createTracker(o = {}) {
     return info;
   }
 
+  /**
+   * Camera-side picture controls (config camera.tune: fractions of the camera's own ranges, e.g. sharpness 0.4 of
+   * 0–20 → 8). Desktop only, applied ONCE right after upgradeCamera settled and before the video is shown; never on
+   * iOS/Safari or phones/tablets, never again mid-session (tracker-sync.js cameraTune decides). Never throws.
+   */
+  async function tuneCamera(track, stale) {
+    const info = camInfo || (camInfo = {});
+    info.tune = 'n/a';
+    try {
+      const c = CC();
+      if (!c.tune || !track?.applyConstraints || !track.getCapabilities) return info;
+      if (apple || isMobileDevice()) { info.tune = 'skipped-mobile'; return info; }
+      const want = cameraTune(track.getCapabilities() || {}, track.getSettings?.() || {}, c.tune, { apple, mobile: isMobileDevice() });
+      if (!want) { info.tune = 'none'; return info; }
+      if (stale()) return info;
+      await track.applyConstraints({ advanced: [want] });
+      const s = track.getSettings?.() || {};
+      const got = Object.fromEntries(Object.keys(want).map(k => [k, s[k] ?? null]));
+      info.tune = Object.keys(want).map(k => `${k}=${got[k] ?? '?'}`).join(',');
+      info.tuned = got;
+    } catch (e) { info.tune = 'refused'; }
+    return info;
+  }
+
   function stopStream() {
     if (stream) for (const t of stream.getTracks()) { t.onended = null; try { t.stop(); } catch (e) { /* */ } }
     stream = null;
@@ -352,7 +411,11 @@ export async function createTracker(o = {}) {
     flushRing(); hist.length = 0;
     lastShownMt = -1; lastTickMt = -1; curFrameMt = -1; m.lastMt = null; m.firstResultAt = 0;
     resultTimes.length = 0; videoTimes.length = 0; presentTimes.length = 0;
-    if (video) { try { video.pause(); } catch (e) { /* */ } video.srcObject = null; }
+    if (video) {
+      try { video.pause(); } catch (e) { /* */ }
+      video.srcObject = null;
+      if (video.getAttribute('src')) { video.removeAttribute('src'); video.loop = false; try { video.load(); } catch (e) { /* */ } }
+    }
   }
 
   async function requestWakeLock() {
@@ -400,21 +463,27 @@ export async function createTracker(o = {}) {
     stopStream();
     emit('status', 'camera-starting');
     let s;
-    try { s = await navigator.mediaDevices.getUserMedia(constraints()); }
-    catch (e) {
-      if (stale()) return superseded(job);
-      if (e?.name !== 'OverconstrainedError') throw e;
-      s = await navigator.mediaDevices.getUserMedia({ video: { facingMode: facing }, audio: false });
+    if (fakeVideo) s = fakeStream();
+    else {
+      try { s = await navigator.mediaDevices.getUserMedia(constraints()); }
+      catch (e) {
+        if (stale()) return superseded(job);
+        if (e?.name !== 'OverconstrainedError') throw e;
+        s = await navigator.mediaDevices.getUserMedia({ video: { facingMode: facing }, audio: false });
+      }
     }
     if (stale()) return superseded(job, s);
     // before the video is shown: no visible switch of resolution
     await upgradeCamera(s.getVideoTracks()[0], stale);
     if (stale()) return superseded(job, s);
+    await tuneCamera(s.getVideoTracks()[0], stale);   // desktop only; once (R5)
+    if (stale()) return superseded(job, s);
     if (stream) stopStream();   // never two streams
     stream = s;
     const track = s.getVideoTracks()[0];
     if (track) track.onended = onTrackEnded;
-    video.srcObject = s;
+    if (fakeVideo) { video.loop = true; video.src = new URL('/tools/data/' + fakeVideo, location.origin).href; }
+    else video.srcObject = s;
     try {
       // not awaited: play() of a stream that never delivers a frame stays pending, which would skip the timeout
       video.play()?.catch?.(() => {});
@@ -432,6 +501,17 @@ export async function createTracker(o = {}) {
     diagStart();
     if (loopOn) scheduleLoop();
     return { vw: video.videoWidth, vh: video.videoHeight, facing, mirror: facing === 'user' };
+  }
+
+  /** ?fakevideo: a stand-in for the MediaStream (one 'live' video track; stop() pauses the file) */
+  function fakeStream() {
+    const track = {
+      kind: 'video', label: 'fakevideo:' + fakeVideo, readyState: 'live', onended: null,
+      stop() { this.readyState = 'ended'; },
+      getSettings: () => ({ width: video.videoWidth, height: video.videoHeight, frameRate: 30 }),
+      getCapabilities: () => ({}),
+    };
+    return { getTracks: () => [track], getVideoTracks: () => [track], getAudioTracks: () => [] };
   }
 
   function waitForVideo(timeoutMs = 8000, cancelled = () => false) {
@@ -526,7 +606,7 @@ export async function createTracker(o = {}) {
   }
 
   function grabFrame(mt) {
-    if (frameSource === 'none') return null;
+    if (frameSource === 'none' || strat?.capture === 'video') return null;
     if (frameSource === 'auto' && typeof VideoFrame === 'function') {
       try { return new VideoFrame(video, { timestamp: Math.round((mt || 0) * 1e6) }); }
       catch (e) { frameSource = 'bitmap'; }
@@ -582,7 +662,7 @@ export async function createTracker(o = {}) {
     const vh = frame ? (frame.displayHeight || frame.height) : video.videoHeight;
     // a big camera frame is detected on a downscaled copy (same aspect → normalized landmarks map onto the full frame)
     let small = null;
-    const sz = detectSize(vw, vh);
+    const sz = frame ? detectSize(vw, vh) : null;   // strategy c: the <video> goes in as it is (no copies)
     if (sz && detScaleOk && typeof createImageBitmap === 'function') {
       try { small = await createImageBitmap(src, { resizeWidth: sz.w, resizeHeight: sz.h, resizeQuality: 'medium' }); }
       catch (e) { detScaleOk = false; small = null; }
@@ -592,20 +672,21 @@ export async function createTracker(o = {}) {
     lastTs = ts;
     let res;
     const t0 = performance.now();
+    const inp = small || src;
+    const lum = health.wantLum(t0) ? meanLum(frameHash(inp)) : null;   // health: brightness of what MediaPipe sees
     try {
-      const inp = small || src;
       res = cur.backend === 'gesture' ? task.recognizeForVideo(inp, ts) : task.detectForVideo(inp, ts);
       small?.close(); small = null;
     } catch (e) {
       m.errors++;
       try { small?.close(); } catch (_) { /* */ }
       try { frame?.close(); } catch (_) { /* */ }
-      // Input-type problems (e.g. a browser whose MediaPipe path can't take VideoFrame): step down
-      // VideoFrame → ImageBitmap → the <video> element itself (frame = null → stage uses a live VideoTexture).
-      if (frame && typeof VideoFrame === 'function' && frame instanceof VideoFrame) frameSource = 'bitmap';
-      else if (frame) frameSource = 'none';
-      console.warn('[tracker] detect failed → rebuild', e?.message || e);
-      if (rebuildsInRow >= TC().maxRebuilds) { emit('error', { code: 'tracker', error: e, fatal: true }); return null; }
+      console.warn('[tracker] detect failed', e?.message || e);
+      // too many in a row → next strategy; unproven on the CPU delegate already → next strategy;
+      // else rebuild (GPU: retry once, then CPU) and give the rebuilt task its own health window
+      if (rebuildsInRow >= TC().maxRebuilds) { nextStrategy('detect-fatal'); return null; }
+      if (health.armed && cur?.delegate !== 'GPU') { nextStrategy('detect'); return null; }
+      if (health.armed) health.reset();
       rebuild(e);
       return null;
     }
@@ -641,6 +722,7 @@ export async function createTracker(o = {}) {
     if (m.lastDetectAt) { const fps = 1000 / Math.max(1, t0 - m.lastDetectAt); m.detectFps = m.detectFps ? m.detectFps * 0.9 + fps * 0.1 : fps; }
     m.lastDetectAt = t0; m.lastMt = mt;
     { const tr = performance.now(); resultTimes.push(tr); pruneWindow(resultTimes, tr, 1000); }   // same metric as the worker path; pruned here (R2-36)
+    if (!m.firstResultLat && m.healthArmedAt) m.firstResultLat = Math.round(performance.now() - m.healthArmedAt);
     m.frames++;
     const hands = toHands(res);
     { const rid = ++seq; for (const h of hands) h.src = rid; }   // result id: frame-count gates count per result (R2-5)
@@ -648,7 +730,11 @@ export async function createTracker(o = {}) {
     m.lastHash = hashOn && frame ? frameHash(frame) : null;
     if (frame) { pendingFrames.push(frame); retireFrames(2); }
     deliverTs = Math.max(deliverTs + 1, ts);
-    return { hands, vw, vh, frame, nowMs: deliverTs, mediaTime: mt, frameMode: 'sync', frameHash: m.lastHash };
+    const hv = health.result(performance.now(), lum);
+    if (hv === 'black') { if (frame) { pendingFrames.pop(); try { frame.close(); } catch (_) { /* */ } } nextStrategy('black'); return null; }
+    if (hv === 'ok') setHealth('ok', strat?.code);
+    // no frame = the live video texture shows (strategy c); a frame = the detected frame itself
+    return { hands, vw, vh, frame, nowMs: deliverTs, mediaTime: mt, frameMode: frame ? 'sync' : 'live', frameHash: m.lastHash };
   }
 
   // ---- worker detection -------------------------------------------------------------------------------
@@ -751,28 +837,42 @@ export async function createTracker(o = {}) {
     // label = the time of THIS frame (R2-14): the frame callback's mediaTime, or — for a detect started between
     // frame callbacks (worker answered → newest frame sent at once) — the VideoFrame's own timestamp
     let mt = frameMt(), frame = null, display = null;
-    if (frameSource === 'auto' && typeof VideoFrame === 'function') {
+    const canvasCap = strat?.capture === 'canvas';   // strategy b: 2D canvas drawImage → ImageBitmap
+    if (!canvasCap && frameSource === 'auto' && typeof VideoFrame === 'function') {
       try {
         frame = new VideoFrame(video);
         const ft = frame.timestamp / 1e6;
         if ((vfClock || !hasRVFC) && Number.isFinite(ft) && Math.abs(ft - mt) >= 0.0005) mt = ft;
-      } catch (e) { frameSource = 'bitmap'; frame = null; }
+      } catch (e) {
+        // strategy a cannot capture here → b (the health window would only find out 4 s later)
+        if (strat?.capture === 'vf') { nextStrategy('capture'); return null; }
+        frameSource = 'bitmap'; frame = null;
+      }
     }
     if (mt === lastMediaTime) { try { frame?.close(); } catch (e) { /* */ } m.skipped++; return null; }
     lastMediaTime = mt;
     const slot = inflight = { seq: ++seq, mt, gen: streamGen, display: null, resolve: null, posted: false };
     const wantDisplay = modeCtl.mode === 'sync' && frameSource !== 'none';
     try {
-      // 'auto' → VideoFrame; 'bitmap' / 'none' → ImageBitmap (a copy: holds no camera buffer)
-      if (!frame) frame = await createImageBitmap(video);
-      if (wantDisplay) {
-        display = typeof frame.clone === 'function' ? frame.clone() : await createImageBitmap(frame);
-        trackFrame(display, displaySet); ledger.displayMade++;
+      if (canvasCap) {
+        // the most compatible capture: draw the video into a 2D canvas, bitmaps from the canvas (worker + display)
+        drawCapture();
+        const both = await Promise.all([createImageBitmap(capCv), wantDisplay ? createImageBitmap(capCv) : null]);
+        frame = both[0]; display = both[1];
+        if (display) { trackFrame(display, displaySet); ledger.displayMade++; }
+      } else {
+        // 'auto' → VideoFrame; 'bitmap' / 'none' → ImageBitmap (a copy: holds no camera buffer)
+        if (!frame) frame = await createImageBitmap(video);
+        if (wantDisplay) {
+          display = typeof frame.clone === 'function' ? frame.clone() : await createImageBitmap(frame);
+          trackFrame(display, displaySet); ledger.displayMade++;
+        }
       }
     } catch (e) {
       try { frame?.close(); } catch (_) { /* */ }   // never reached the worker; closed here
       closeDisplay(display);
       if (inflight === slot) inflight = null;
+      if (health.armed) nextStrategy('capture');   // a capture that fails while unproven → next strategy
       return null;
     }
     if (closed || !worker || inflight !== slot || slot.gen !== streamGen) {
@@ -788,20 +888,30 @@ export async function createTracker(o = {}) {
       slot.resolve = resolve;
       try {
         slot.sentAt = performance.now();
-        worker.postMessage({ t: 'detect', seq: slot.seq, frame, ts, hash: hashOn }, [frame]);
+        slot.lum = health.wantLum(slot.sentAt);   // health: ask for the thumbnail → brightness of the detected frame
+        worker.postMessage({ t: 'detect', seq: slot.seq, frame, ts, hash: hashOn || slot.lum }, [frame]);
         slot.posted = true; ledger.made++;
       } catch (e) {
-        // transfer not supported for this frame type → try ImageBitmap next time, or give up on the worker
+        // transfer not supported for this frame type → the next strategy (b: canvas bitmaps; then main thread)
         try { frame.close(); } catch (_) { /* */ }
         inflight = null; closeDisplay(display); resolve(null);
-        if (frameSource === 'auto') frameSource = 'bitmap'; else fallbackToMain('postMessage: ' + (e?.message || e));
+        nextStrategy('transfer');
       }
     });
   }
 
+  /** strategy b: the current video frame into the capture canvas (sized like the video) */
+  function drawCapture() {
+    const w = video.videoWidth, h = video.videoHeight;
+    if (!capCv) capCv = document.createElement('canvas');
+    if (capCv.width !== w || capCv.height !== h) { capCv.width = w; capCv.height = h; capCtx = null; }
+    capCtx ||= capCv.getContext('2d', { alpha: false });
+    capCtx.drawImage(video, 0, 0, w, h);
+  }
+
   function onWorkerMessage(ev) {
     const msg = ev.data || {};
-    if (msg.closed != null) ledger.workerClosed = msg.closed;
+    if (msg.closed != null) { ledger.workerClosedCur = msg.closed; ledger.workerClosed = ledger.workerClosedBase + msg.closed; }
     if (msg.check) gpuCheck = msg.check;
     if (msg.t === 'result' || msg.t === 'skip') {
       const slot = inflight;
@@ -813,15 +923,21 @@ export async function createTracker(o = {}) {
         closeDisplay(slot.display);
         if (msg.reason === 'error') {
           m.errors++;
-          if (frameSource === 'auto' && /video ?frame|unsupported|type/i.test(msg.message || '')) frameSource = 'bitmap';
-          console.warn('[tracker] worker detect failed → rebuild', msg.message);
+          console.warn('[tracker] worker detect failed', msg.message);
           emit('error', { code: msg.fatal ? 'tracker' : 'detect', error: new Error(msg.message), fatal: false });
-          if (msg.fatal) fallbackToMain('worker detect errors: ' + msg.message);
-          else m.rebuilds++;
+          // the worker gave up (maxRebuilds) → next strategy; unproven on the CPU delegate already → next strategy;
+          // else the worker rebuilds itself (GPU: retry once, then CPU) and gets a fresh health window
+          if (msg.fatal) nextStrategy('detect-fatal');
+          else if (health.armed && cur?.delegate !== 'GPU') nextStrategy('detect');
+          else { m.rebuilds++; if (health.armed) health.reset(); }
         }
         slot.resolve?.(null);
         return;
       }
+      // health: ≥ 3 results, not black (sampled thumbnails) → ok; black → the next strategy
+      const hv = health.result(now, slot.lum ? meanLum(msg.hash) : null);
+      if (hv === 'black') { closeDisplay(slot.display); slot.resolve?.(null); nextStrategy('black'); return; }
+      if (hv === 'ok') setHealth('ok', strat?.code);
       if (msg.cur && (!cur || msg.cur.backend !== cur.backend || msg.cur.delegate !== cur.delegate || msg.cur.numHands !== cur.numHands)) cur = { ...msg.cur };
       const dt = msg.ms;
       m.detectMs = m.frames ? m.detectMs * 0.9 + dt * 0.1 : dt;
@@ -838,6 +954,7 @@ export async function createTracker(o = {}) {
       for (const h of msg.hands) h.src = slot.seq;   // result id: delayed mode presents it on several frames (R2-5)
       m.handsSum += msg.hands.length;
       m.firstResultAt ||= now;
+      if (!m.firstResultLat && m.healthArmedAt) m.firstResultLat = Math.round(now - m.healthArmedAt);
       resultTimes.push(now); pruneWindow(resultTimes, now, 1000);
       updateMode(now);
       const mode = modeCtl.mode;
@@ -853,7 +970,7 @@ export async function createTracker(o = {}) {
       let frame = slot.display;
       if (frame && mode !== 'sync') { closeDisplay(frame); frame = null; }
       if (frame) { pendingFrames.push(frame); retireFrames(2); }
-      m.lastMt = slot.mt; m.lastHash = msg.hash || null;
+      m.lastMt = slot.mt; m.lastHash = hashOn ? msg.hash || null : null;
       deliverTs = Math.max(deliverTs + 1, slot.ts);
       slot.resolve?.({ hands: msg.hands, vw: msg.vw || slot.vw, vh: msg.vh || slot.vh, frame, nowMs: deliverTs, mediaTime: slot.mt, frameMode: mode, frameHash: m.lastHash });
       return;
@@ -865,7 +982,7 @@ export async function createTracker(o = {}) {
       return;
     }
     if (msg.t === 'gpuCheck') { gpuCheck = { ...msg }; delete gpuCheck.t; return; }
-    if (msg.t === 'fatal') { fallbackToMain('worker fatal: ' + msg.message); return; }
+    if (msg.t === 'fatal') { nextStrategy('worker'); return; }
   }
 
   function killWorker() {
@@ -873,35 +990,102 @@ export async function createTracker(o = {}) {
     try { worker.postMessage({ t: 'close' }); } catch (e) { /* */ }
     try { worker.terminate(); } catch (e) { /* */ }
     worker = null;
+    // leak ledger across workers: what this worker closed stays counted; a frame it held dies with it (counted too)
+    ledger.workerClosedBase += ledger.workerClosedCur + (inflight?.posted ? 1 : 0);
+    ledger.workerClosedCur = 0; ledger.workerClosed = ledger.workerClosedBase;
     if (inflight) { const s = inflight; inflight = null; closeDisplay(s.display); s.resolve?.(null); }
   }
 
-  /** Worker broke at runtime → the original main-thread path (frames stay in 'sync'). */
-  function fallbackToMain(reason) {
-    if (!useWorker) return;
-    console.warn('[tracker] worker path off → main thread:', reason);
-    useWorker = false; workerFallback = String(reason).slice(0, 200);
-    if (modeCtl.set('sync', performance.now())) onModeChange('sync');
-    killWorker();
-    // start where the worker was: once it had moved to CPU (GPU slow / slower than CPU) the GPU is not re-tested
-    // on the render thread (R2-33)
-    const startIdx = mainStartIdx(chain, cur, gpuCheck.state);
-    rebuilding = (async () => {
-      try { if (!closed) { await loadVision(); await buildFrom(startIdx); } }
-      catch (e) { emit('error', { code: 'tracker', error: e, fatal: true }); }
-      finally { rebuilding = null; }
+  // ---- self-healing chain ---------------------------------------------------------------------------------
+  function setHealth(state, code) {
+    const changed = state !== healthState || code !== healthCode;
+    healthState = state; healthCode = code || null;
+    if (changed) emit('status', { state, code: healthCode, strategy: strat?.key || null });
+  }
+
+  /** the worker's delegate chain for this strategy: iOS/Safari keep the GPU off the worker (unreliable there) */
+  const workerChain = () => (apple ? chain.filter(st => st.delegate === 'CPU') : chain);
+
+  /** stop the current strategy's detector (the camera stream stays) */
+  function teardownStrategy() {
+    killWorker(); closeTask();
+    flushRing(); hist.length = 0; retireFrames(2);
+    lastMediaTime = -1; m.firstResultAt = 0; resultTimes.length = 0; presentTimes.length = 0;
+    health.reset(); slowSamples = []; gpuWatch.reset(); rebuildsInRow = 0;
+  }
+
+  /**
+   * Build strategy plan[i] (then the following ones when it cannot even start). Resolves true when a detector is
+   * ready, false when none of the remaining strategies started (fatal already emitted).
+   */
+  async function buildStrategy(i) {
+    for (; i < plan.length; i++) {
+      if (closed) return false;
+      const st = STRATEGIES[plan[i]];
+      stratIdx = i; strat = st;
+      useWorker = st.worker;
+      frameSource = st.capture === 'vf' ? TC().videoFrames : st.capture === 'canvas' ? 'bitmap' : 'none';
+      const mode = st.capture === 'video' ? 'live' : 'sync';
+      if (modeCtl.set(mode, performance.now())) onModeChange(mode);
+      let ok = false, why = '';
+      try {
+        if (st.worker) { ok = await startWorker(workerChain()); why = workerFallback || 'init'; }
+        else {
+          // start where the worker was: once it had moved to CPU (GPU slow / slower than CPU) the GPU is not
+          // re-tested on the render thread (R2-33)
+          await loadVision();
+          // (iOS/Safari: the worker was CPU-only by design → the main thread does test its GPU delegate)
+          ok = !!await buildFrom(i > 0 && !apple ? mainStartIdx(chain, cur, gpuCheck.state) : 0);
+        }
+      } catch (e) { ok = false; why = e?.message || String(e); }
+      if (closed) return false;
+      if (ok) { workerFallback = useWorker ? null : (tried.length ? tried.join(',') : workerFallback); return true; }
+      tried.push(`${st.code}-init`);
+      console.warn(`[tracker] strategy ${st.key} (${st.code}) could not start: ${why}`);
+    }
+    setHealth('fatal', tried[tried.length - 1] || 'none');
+    emit('error', { code: 'tracker', error: new Error('no detection strategy could start: ' + tried.join(',')), fatal: true, reason: healthCode });
+    return false;
+  }
+
+  /**
+   * The current strategy is unhealthy (reason: timeout | black | detect | detect-fatal | capture | transfer |
+   * worker | watchdog): stop it, keep the camera, start the next one. After the last: status 'fatal' + code.
+   * 'black' on the last strategy keeps its detector running (a dark room is not a broken pipeline; the health
+   * check re-arms and reports 'ok' when light returns).
+   */
+  function nextStrategy(reason) {
+    if (closed || switching || !strat) return;
+    const code = `${strat.code}-${reason}`;
+    const last = stratIdx + 1 >= plan.length;
+    if (last && reason === 'black') {   // keep detecting and re-check every few results (no growing list)
+      if (tried[tried.length - 1] !== code) { tried.push(code); console.warn(`[tracker] strategy ${strat.key}: ${code} (kept running)`); }
+      setHealth('fatal', code); health.arm(performance.now()); return;
+    }
+    tried.push(code);
+    console.warn(`[tracker] strategy ${strat.key} unhealthy: ${code}`);
+    teardownStrategy();
+    if (last) {
+      setHealth('fatal', code);
+      emit('error', { code: 'tracker', error: new Error(code), fatal: true, reason: code });
+      return;
+    }
+    setHealth('retrying', code);
+    switching = rebuilding = (async () => {
+      try { await buildStrategy(stratIdx + 1); }
+      catch (e) { console.warn('[tracker] strategy switch failed', e?.message || e); }
+      finally { rebuilding = null; switching = null; }
     })();
   }
 
-  /** true, or why the worker path is not used */
-  function workerSupport() {
+  /** true, or why no worker strategy can run */
+  function workerSupport(firstDelegate) {
     if (o.worker === false) return 'disabled-by-query';
     if (TC().worker === false) return 'disabled-by-config';
-    if (!(typeof Worker === 'function' && typeof OffscreenCanvas === 'function'
-      && (typeof VideoFrame === 'function' || typeof createImageBitmap === 'function'))) return 'unsupported';
+    if (!(typeof Worker === 'function' && typeof OffscreenCanvas === 'function' && typeof createImageBitmap === 'function')) return 'unsupported';
     // Safari 16.4–16.x: OffscreenCanvas without WebGL → the worker would silently run on CPU while the main
-    // thread could use the GPU delegate.
-    if (chain[0].delegate === 'GPU') {
+    // thread could use the GPU delegate (not checked when the worker is CPU-only anyway: iOS/Safari).
+    if (firstDelegate === 'GPU') {
       try {
         const gl = new OffscreenCanvas(1, 1).getContext('webgl2');
         if (!gl) return 'no-offscreen-webgl2';
@@ -912,14 +1096,16 @@ export async function createTracker(o = {}) {
   }
 
   /** Start tracker.worker.js with the preloaded wasm + model. Resolves true when its first task is ready. */
-  async function startWorker() {
-    const bytes = await loadModel(chain[0].backend);
+  async function startWorker(wchain = chain) {
+    if (!wchain.length) { workerFallback = 'no delegate for the worker'; return false; }
+    const bytes = await loadModel(wchain[0].backend);
     const C = CORE_T();
     let w;
     try { w = new Worker(o.workerUrl || new URL('./tracker.worker.js', import.meta.url)); }
     catch (e) { workerFallback = 'new Worker: ' + (e?.message || e); return false; }
+    const initMs = mobile ? (TC().workerInitMsMobile ?? 15000) : (TC().workerInitMs ?? 45000);
     const ok = await new Promise(resolve => {
-      const timer = setTimeout(() => { workerFallback = 'init timeout'; resolve(false); }, TC().workerInitMs ?? 45000);
+      const timer = setTimeout(() => { workerFallback = 'init timeout'; resolve(false); }, initMs);
       w.onmessage = ev => {
         const msg = ev.data || {};
         if (msg.t === 'ready') {
@@ -934,9 +1120,9 @@ export async function createTracker(o = {}) {
         t: 'init',
         bundleUrl: url('vendor/mediapipe/vision_bundle.js'),
         fileset: { wasmLoaderPath: wasmFileset.wasmLoaderPath, wasmBinaryPath: wasmFileset.wasmBinaryPath },
-        models: { [chain[0].backend]: copy },
+        models: { [wchain[0].backend]: copy },
         modelUrls: { gesture: url(MODEL_FILE.gesture), landmarker: url(MODEL_FILE.landmarker) },
-        chain, forceDelegate: forceDelegate || null,
+        chain: wchain, forceDelegate: forceDelegate || (wchain.every(st => st.delegate === 'CPU') ? 'CPU' : null),
         hands: { GPU: handsFor('GPU'), CPU: handsFor('CPU') },
         conf: { minDetection: C.minDetection ?? 0.6, minPresence: C.minPresence ?? 0.6, minTracking: C.minTracking ?? 0.5 },
         gpuCheck: GPU_CHECK, maxRebuilds: TC().maxRebuilds, detectLong: DETECT_LONG(),
@@ -944,10 +1130,10 @@ export async function createTracker(o = {}) {
     });
     if (!ok) { try { w.terminate(); } catch (e) { /* */ } return false; }
     if (closed) { try { w.terminate(); } catch (e) { /* */ } return false; }
-    worker = w;
+    worker = w; ledger.workerClosedCur = 0;
     w.onmessage = onWorkerMessage;
-    w.onerror = ev => { ev.preventDefault?.(); fallbackToMain('worker error: ' + (ev.message || '?')); };
-    w.onmessageerror = () => fallbackToMain('messageerror');
+    w.onerror = ev => { ev.preventDefault?.(); if (worker === w) nextStrategy('worker'); };
+    w.onmessageerror = () => { if (worker === w) nextStrategy('worker'); };
     emit('backend', { ...cur });
     return true;
   }
@@ -985,8 +1171,16 @@ export async function createTracker(o = {}) {
     if (missed && useWorker && !paused && token === loopToken && loopOn) runWorkerDetect(token, performance.now());
   }
   const deliver = r => { for (const fn of listeners.result) { try { fn(r); } catch (e) { console.error(e); } } };
+  /** health window: armed once this strategy's detector is ready and camera frames flow; timeout → next strategy */
+  function healthTick(now) {
+    if (healthState === 'fatal' && !health.armed) return;
+    const ready = !rebuilding && !switching && (useWorker ? !!worker : !!task);
+    if (!health.on && ready && video && video.readyState >= 2 && video.videoWidth) { health.arm(now, cur?.delegate); m.healthArmedAt = now; m.firstResultLat = 0; }
+    if (health.tick(now) === 'timeout') nextStrategy('timeout');
+  }
   async function tick(token) {
     if (token !== loopToken || !loopOn) return;
+    healthTick(performance.now());
     if (useWorker) {
       // keep receiving every video frame (mode clock + camera fps); detection runs only when the worker is idle
       scheduleLoop();
@@ -999,11 +1193,12 @@ export async function createTracker(o = {}) {
       updateMode(now);
       present(now);
       // watchdog: a detect the worker never answers (GPU stall, frame lost in transfer) → main thread
-      if (inflight?.posted && workerStalled(inflight.sentAt, now, m.detectMs, m.frames)) { fallbackToMain('worker timeout'); return; }
+      if (inflight?.posted && workerStalled(inflight.sentAt, now, m.detectMs, m.frames)) { nextStrategy('watchdog'); return; }
       if (busy || paused) { if (busy) { m.skipped++; missed = true; } return; }
       runWorkerDetect(token, now);
       return;
     }
+    if (curFrameMt !== lastTickMt) { lastTickMt = curFrameMt; const now = performance.now(); videoTimes.push(now); pruneWindow(videoTimes, now, 1000); }
     if (!busy && !paused) {
       busy = true;
       try {
@@ -1096,12 +1291,11 @@ export async function createTracker(o = {}) {
     await loadModel(chain[0].backend);
     // downloads done (task init still to come): the SW may now cache them — a 304, no second download
     precacheHint([wasmUrl, url(MODEL_FILE[chain[0].backend])]);
-    const support = workerSupport();
-    if (support === true) {
-      try { useWorker = await startWorker(); } catch (e) { useWorker = false; workerFallback = 'start: ' + (e?.message || e); }
-      if (!useWorker) console.warn('[tracker] worker unavailable → main-thread detection:', workerFallback);
-    } else workerFallback = support;
-    if (!useWorker) await buildFrom(0);
+    const forced = o.strategy || (TC().strategy !== 'auto' ? TC().strategy : null);
+    const support = workerSupport(apple ? 'CPU' : chain[0].delegate);
+    if (support !== true) workerFallback = support;
+    plan = strategyPlan({ forced, apple, workerOk: support === true, hasVideoFrame: typeof VideoFrame === 'function', noWorker: o.worker === false || TC().worker === false });
+    if (!await buildStrategy(0)) throw Object.assign(new Error('tracker: no detection strategy could start: ' + tried.join(',')), { code: 'tracker' });
   } catch (e) {
     // failed preload (model download): leave nothing behind, the caller may simply create a new tracker (R2-1)
     releaseAll(); killWorker(); closeTask();
@@ -1165,6 +1359,9 @@ export async function createTracker(o = {}) {
         // camera mode chosen by upgradeCamera; detectW = width of the copy MediaPipe analyses (≤ detectLong)
         camera: camInfo ? { ...camInfo } : null, detectW: m.detW || 0, prepMs: +(m.prepMs || 0).toFixed(2),
         worker: useWorker, workerFallback, frameMode: modeCtl.mode, frameSource, modeSwitches: modeCtl.switches,
+        // self-healing chain: current strategy, plan, reason codes of the strategies given up, health verdict
+        strategy: strat?.key || null, strategyCode: strat?.code || null, strategyPlan: plan.slice(), strategiesTried: tried.slice(),
+        health: healthState, healthCode, healthMean: health.mean == null ? null : +health.mean.toFixed(1), firstResultMs: m.firstResultLat || 0, apple,
         resultRate: rate(resultTimes, now), videoFps: rate(videoTimes, now), presentRate: rate(presentTimes, now),
         latencyMs: +(m.latencyMs || 0).toFixed(1), displayDelayMs: modeCtl.mode === 'delayed' ? Math.round(delayMs()) : 0,
         heldPresentations: m.held || 0, skeletonLagMs: modeCtl.mode === 'delayed' ? +(m.lagMs || 0).toFixed(1) : modeCtl.mode === 'sync' ? 0 : null,
@@ -1185,5 +1382,7 @@ export async function createTracker(o = {}) {
       for (const k in listeners) listeners[k].clear();
     },
   };
+  // dev/test hook (localhost only): tools read the tracker's own metrics()/on('status') without going through main.js
+  try { if (typeof window !== 'undefined' && DEV_HOSTS.has(location.hostname)) window.__hsTracker = api; } catch (e) { /* */ }
   return api;
 }

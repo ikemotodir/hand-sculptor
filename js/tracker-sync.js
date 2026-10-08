@@ -202,3 +202,123 @@ export class RollingMedian {
   median() { const s = this.win.slice().sort((x, y) => x - y); return s.length ? s[s.length >> 1] : 0; }
   reset() { this.win = []; this.n = 0; }
 }
+
+// ── self-healing detection chain (2026-10-08: iPhone showed the camera but never a skeleton) ─────────────
+/**
+ * Detection strategies, tried in order until one is HEALTHY (HealthCheck):
+ *   a  W-VF   worker + VideoFrame transfer (fastest; Chrome desktop/Android)
+ *   b  W-BM   worker + ImageBitmap drawn from a 2D canvas (most compatible capture; iOS starts here, CPU delegate)
+ *   c  M-VID  main thread + the <video> element itself handed to MediaPipe (no frame copies; live video texture)
+ * Reason codes: `${code}-${reason}` (W-VF-timeout, W-BM-black, M-VID-error, …).
+ */
+export const STRATEGIES = {
+  a: { key: 'a', code: 'W-VF', worker: true, capture: 'vf' },
+  b: { key: 'b', code: 'W-BM', worker: true, capture: 'canvas' },
+  c: { key: 'c', code: 'M-VID', worker: false, capture: 'video' },
+};
+
+/** iOS (any browser: all are WebKit) or Safari itself (UA "Safari/" without Chrome/Edge/Opera/Android). */
+export function appleBrowser(ua = '') {
+  if (/iPhone|iPad|iPod/i.test(ua)) return true;
+  return /Safari\//.test(ua) && !/Chrome|Chromium|CriOS|FxiOS|Edg|OPR|Android/.test(ua);
+}
+
+/**
+ * Camera-side picture controls (config media.camera.tune, desktop only). Pure: decides WHAT to apply, tracker.js
+ * applies it once. Each key of `tune` (sharpness, contrast, saturation, brightness) is a fraction 0–1 of the track's
+ * own capability range {min, max[, step]}; the resulting value is rounded to the step and clamped. Returns the
+ * constraint set for applyConstraints({advanced:[set]}) or null when nothing should be touched:
+ * iOS/Safari or any phone/tablet (a mid-stream applyConstraints can freeze/blacken the feed there), no tune config,
+ * a control the camera does not expose, or a value the camera already has.
+ * @param {object} caps     track.getCapabilities()
+ * @param {object} settings track.getSettings()
+ * @param {object} tune     e.g. { sharpness: 0.4 }
+ * @param {{apple?:boolean, mobile?:boolean}} env
+ */
+export function cameraTune(caps, settings, tune, { apple = false, mobile = false } = {}) {
+  if (apple || mobile || !tune || typeof tune !== 'object' || !caps || typeof caps !== 'object') return null;
+  const out = {};
+  for (const [k, frac] of Object.entries(tune)) {
+    const r = caps[k];
+    if (typeof frac !== 'number' || !isFinite(frac) || !r || typeof r !== 'object') continue;
+    const min = Number(r.min), max = Number(r.max);
+    if (!isFinite(min) || !isFinite(max) || max <= min) continue;
+    const step = Number(r.step) > 0 ? Number(r.step) : 1;
+    const f = Math.min(1, Math.max(0, frac));
+    let v = min + Math.round((max - min) * f / step) * step;
+    v = Math.min(max, Math.max(min, +v.toFixed(6)));
+    const cur = settings && typeof settings[k] === 'number' ? settings[k] : null;
+    if (cur != null && Math.abs(cur - v) < step / 2) continue;   // already there
+    out[k] = v;
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+/**
+ * Ordered strategy keys for this device.
+ * @param {object} o
+ * @param {'a'|'b'|'c'|null} [o.forced]   ?cfg.media.tracker.strategy / createTracker({strategy}): start here
+ * @param {boolean} [o.apple]             iOS / Safari → start at b (MediaPipe GPU in Safari workers is unreliable;
+ *                                        VideoFrame transfer to a worker is not)
+ * @param {boolean} [o.workerOk]          Worker + OffscreenCanvas available (tracker.js workerSupport)
+ * @param {boolean} [o.hasVideoFrame]     typeof VideoFrame === 'function'
+ * @param {boolean} [o.noWorker]          ?worker=0 / config worker:false → main thread only
+ */
+export function strategyPlan({ forced = null, apple = false, workerOk = true, hasVideoFrame = true, noWorker = false } = {}) {
+  const all = ['a', 'b', 'c'];
+  if (noWorker || !workerOk) return ['c'];
+  let keys = (apple || !hasVideoFrame) ? ['b', 'c'] : all;
+  if (forced && STRATEGIES[forced]) keys = all.slice(all.indexOf(forced));
+  return keys;
+}
+
+/** mean grey level (0–255) of an 8×8 thumbnail (tracker frameHash), or null */
+export function meanLum(hash) {
+  if (!hash || !hash.length) return null;
+  let s = 0; for (const v of hash) s += v;
+  return s / hash.length;
+}
+
+/**
+ * Per-strategy health check, two phases. arm(now, delegate) when the strategy's task is ready AND camera frames
+ * flow. (1) The FIRST result must arrive within firstMs[delegate] (the GPU delegate compiles shaders on its first
+ * detection: measured 3–8 s on an Intel UHD in headless Chrome; CPU starts in ~1 s). (2) From that first result,
+ * minResults results (hands or not) within windowMs, and lumSamples of them (taken ≥ lumAfterMs after arming:
+ * cameras open dark) must not all be black (mean grey < blackLum) → verdict 'ok' | 'black'; tick(now) past either
+ * budget → 'timeout'. Frames whose brightness cannot be measured count as not-black.
+ */
+export class HealthCheck {
+  constructor({ windowMs = 4000, firstMs = { GPU: 12000, CPU: 6000 }, minResults = 3, lumSamples = 3, blackLum = 8, lumAfterMs = 500 } = {}) {
+    this.windowMs = windowMs; this.firstMs = { GPU: 12000, CPU: 6000, ...(firstMs || {}) };
+    this.minResults = minResults; this.lumSamples = lumSamples; this.blackLum = blackLum; this.lumAfterMs = lumAfterMs;
+    this.reset();
+  }
+  reset() { this.on = false; this.armedAt = 0; this.firstAt = 0; this.delegate = 'GPU'; this.results = 0; this.lums = []; this.lumFail = 0; this.verdict = null; this.mean = null; }
+  arm(now, delegate = 'GPU') { this.reset(); this.on = true; this.armedAt = now; this.delegate = delegate === 'CPU' ? 'CPU' : 'GPU'; }
+  /** armed and undecided (after a verdict: false until the next arm()) */
+  get armed() { return this.on && !this.verdict; }
+  /** should the next result carry a brightness sample? */
+  wantLum(now) { return this.armed && this.lums.length < this.lumSamples && now - this.armedAt >= this.lumAfterMs; }
+  /** @returns {'ok'|'black'|null} */
+  result(now, lum = null) {
+    if (!this.armed) return null;
+    this.results++;
+    if (!this.firstAt) this.firstAt = now;
+    if (now - this.armedAt >= this.lumAfterMs && this.lums.length < this.lumSamples) {
+      if (lum != null && Number.isFinite(lum)) this.lums.push(lum); else this.lumFail++;
+    }
+    if (this.results < this.minResults) return null;
+    if (this.lums.length < this.lumSamples && this.lumFail < this.lumSamples) return null;   // samples pending (tick() covers a stall)
+    this.mean = this.lums.length ? this.lums.reduce((a, b) => a + b, 0) / this.lums.length : null;
+    this.verdict = this.lums.length === this.lumSamples && this.mean < this.blackLum ? 'black' : 'ok';
+    return this.verdict;
+  }
+  /** @returns {'timeout'|null} */
+  tick(now) {
+    if (!this.armed) return null;
+    const over = this.firstAt ? now - this.firstAt > this.windowMs : now - this.armedAt > (this.firstMs[this.delegate] ?? 12000);
+    if (!over) return null;
+    this.verdict = 'timeout';
+    return 'timeout';
+  }
+}

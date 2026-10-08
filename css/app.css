@@ -100,6 +100,14 @@ svg { display: block; }
 .hs-status[data-state="tracking"] .dot { background: var(--mint); box-shadow: 0 0 10px var(--mint); }
 .hs-status[data-state="lost"] .dot { background: var(--red); box-shadow: 0 0 8px var(--red); }
 @keyframes hs-blink { 50% { opacity: .25; } }
+/* tracker health (R4): while it shows it IS the status row (「てを かざしてね」 would contradict it) and the pose chip
+   hides (no results come while the tracker is retrying / dead). The dot follows it: retrying = amber blink, fatal = red. */
+.hs-health { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: #ffd27a; white-space: nowrap; }
+.hs-health .hc { font: 500 10.5px/1 var(--mono); letter-spacing: .06em; color: var(--tx2); padding: 3px 6px; border-radius: 6px; background: rgba(255, 255, 255, .06); border: 1px solid var(--hair-2); }
+.hs-status.has-health .st-text, .hs-status.has-health .st-cap, .hs-status.has-health .hs-pose { display: none; }
+.hs-status[data-health="fatal"] .hs-health { color: #ff8da1; }
+.hs-status[data-health="retrying"] .dot { background: #ffb84d; box-shadow: 0 0 8px #ffb84d; animation: hs-blink .8s infinite; }
+.hs-status[data-health="fatal"] .dot { background: var(--red); box-shadow: 0 0 8px var(--red); animation: none; }
 .hs-pose {
   display: inline-block; margin-top: 8px; padding: 3px 10px; border-radius: 999px; font-size: 12.5px;
   border: 1px solid var(--acc-2); color: var(--acc); background: rgba(0, 240, 255, .08); letter-spacing: .06em;
@@ -258,6 +266,14 @@ svg { display: block; }
 .lic-body details { border-top: 1px solid var(--hair-2); padding: 10px 2px; }
 .lic-body summary { cursor: pointer; display: flex; align-items: baseline; gap: 10px; font-size: 14px; min-height: 32px; }
 .lic-body pre { font: 10.5px/1.5 var(--mono); white-space: pre-wrap; color: var(--tx2); margin: 8px 0 0; }
+/* 診断 (R4): short mono rows that fit a phone; the text is selectable so it can also be read out or dragged */
+.sheet.diag { width: min(400px, calc(100vw - 24px)); width: min(400px, calc(100cqw - 24px)); gap: 12px; }
+.diag-body { display: grid; grid-template-columns: max-content 1fr; gap: 7px 14px; align-items: baseline; font: 500 13px/1.3 var(--mono); user-select: text; -webkit-user-select: text; }
+.diag-body .dk { color: var(--tx2); font-family: var(--sans); font-size: 12.5px; white-space: nowrap; }
+.diag-body .dv { color: var(--tx); overflow-wrap: anywhere; min-width: 0; }
+.diag-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.diag-actions .hs-btn { min-height: 52px; font-size: 14px; gap: 6px; }
+.hs-hud:not(.hs-mobile) .diag-actions .hs-btn { min-height: var(--tgt); }
 
 /* kiosk attract */
 .hs-attract {
@@ -401,6 +417,12 @@ svg { display: block; }
 .hs-mobile .hs-status { display: flex; align-items: center; gap: 10px; padding: 0 12px; height: 44px; min-width: 0; }
 .hs-mobile .hs-status .hs-brand { display: none; }
 .hs-mobile .hs-status .hs-pose { margin-top: 0; }
+/* phones: the code goes under the text (one row would reach the OBJECTS count on a 360–390 px screen); the card grows
+   to ~50 px, still above the open guide (70 px) */
+.hs-mobile .hs-health { display: grid; gap: 3px; justify-items: start; font-size: 12px; }
+.hs-mobile .hs-status.has-health { height: auto; min-height: 44px; padding-top: 7px; padding-bottom: 8px; }
+.hs-mobile .sheet.diag { width: min(400px, calc(100vw - 24px)); }
+.hs-mobile .diag-body { font-size: 12.5px; }
 
 /* ── start screen ──────────────────────────────────────────────────── */
 #start {

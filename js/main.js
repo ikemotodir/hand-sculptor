@@ -32,7 +32,7 @@ import { createLink } from './link.js';
 import { DEV_HOSTS, devOverrides } from './devcfg.js';
 
 // Support check (index.html, classic script): without importmap + WebGL2 the start screen already says
-// 「ブラウザを 最新にしてね」 — stop here quietly (no errors).
+// 「このブラウザでは 動きません」 — stop here quietly (no errors).
 if (window.__hsSupported === false) await new Promise(() => {});
 
 const Q = new URLSearchParams(location.search);
@@ -778,6 +778,15 @@ applyStyleToAll();
 objects.setStyle({ type: settings.style.type, colorIdx: settings.style.colorIdx, opacity: settings.style.opacity });
 hud.setTracking('loading', 0);
 mirror = effectiveMirror(); stage.setMirror(mirror);
+// R4: せってい → 診断. Tracker-side numbers (the HUD adds browser, screen and health itself). metrics().strategyCode is the
+// self-healing chain's short code (W-VF / W-BM / M-VID); the HUD appends worker|main / frame source / GPU|CPU.
+hud.setDiagProvider(() => {
+  const tm = cam ? cam.metrics() : {};
+  return {
+    strategy: tm.strategyCode || null, worker: tm.worker, frameSource: tm.frameSource, delegate: tm.delegate,
+    resultRate: tm.resultRate, vw: tm.vw, vh: tm.vh, camFps: tm.camera?.fps || tm.videoFps, errors: tm.errors ?? 0, version: VERSION,
+  };
+});
 
 // restore the last scene (not in kiosk)
 let restoredN = 0;
@@ -807,7 +816,12 @@ function loadTracker() {
     onProgress: (b, total) => { if (gen === trackerGen) startUi?.setProgress(total ? b / total : 0); },
   }).then(tr => {
     cam = tr; startUi?.setProgress(1);
-    tr.on('error', ev => { if (ev?.fatal && mode === 'camera') camErrToast(); });   // lost camera (R2-12)
+    // lost camera (R2-12) → toast. A dead detection chain ({code:'tracker'}) keeps the video playing: the health
+    // line on the status card (below) says so instead — never 「カメラが 止まった」 while the camera is fine (R5).
+    tr.on('error', ev => { if (ev?.fatal && ev.code === 'camera' && mode === 'camera') camErrToast(); });
+    // R4: tracker health on the status card. Object statuses {state:'ok'|'retrying'|'fatal', code} only — the
+    // older string statuses ('camera-on', 'frame-sync', …) are not health and are ignored here.
+    tr.on('status', s => { if (s && typeof s === 'object' && typeof s.state === 'string') hud.setHealth(s.state, s.code || ''); });
     return tr;
   });
   p.catch(e => {
@@ -897,6 +911,9 @@ window.__hs = {
       presentRate: tm.presentRate, displayDelayMs: tm.displayDelayMs, heldPresentations: tm.heldPresentations, skeletonLagMs: tm.skeletonLagMs,
       lastMediaTime: tm.lastMediaTime, lastFrameHash: tm.lastFrameHash, framesSent: tm.framesSent, framesWorkerClosed: tm.framesWorkerClosed, framesInFlight: tm.framesInFlight,
       displayMade: tm.displayMade, displayOpen: tm.displayOpen, ringOpen: tm.ringOpen, ringMax: tm.ringMax, maxFps: MAX_FPS, rafHz: Math.round(1000 / rafIv),
+      // self-healing chain (R4/R5): which detection path ran and how it is doing — readable on the published site too (live_check.mjs)
+      strategy: tm.strategy, strategyCode: tm.strategyCode, strategyPlan: tm.strategyPlan, strategiesTried: tm.strategiesTried,
+      health: tm.health, healthCode: tm.healthCode, firstResultMs: tm.firstResultMs,
       tracker: { ...handTracker.stats, dupEvents: undefined },
       alch: { ...alchemy.stats },
       interaction: { grabs: inter.stats.grabs, selects: inter.stats.selects, deselects: inter.stats.deselects, deletes: inter.stats.deletes, rotates: inter.stats.rotates, spins: inter.stats.spins, uiClicks: inter.stats.uiClicks },

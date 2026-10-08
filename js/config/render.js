@@ -9,7 +9,13 @@ export const RENDER = {
   // Final pass: video + holograms. occlusion darkens the camera image slightly behind
   // hologram faces so they stay readable on bright backgrounds (0 = pure additive).
   // くっきり (setting, default on): halo-free unsharp amount + slight contrast / saturation lift of the camera image.
-  composite: { occlusion: 0.45, clarity: true, sharpen: 0.6, contrast: 1.04, saturation: 1.06 },
+  // denoise (2026-10-08, 720p webcams): motion-adaptive temporal blend of the camera image with the previous denoised
+  // frame, run once per NEW camera frame at camera resolution, before くっきり (which then sharpens the clean image).
+  //   strength = blend weight of the previous frame where nothing moved; lo..hi = per-pixel difference (0-1, camera
+  //   values, 5-tap mean) over which the weight fades to 0 → moving hands are never blended (no ghosting).
+  //   enabled = desktop default; mobile = phones/tablets default (off: saves a full-screen pass).
+  composite: { occlusion: 0.45, clarity: true, sharpen: 0.6, contrast: 1.04, saturation: 1.06,
+    denoise: { enabled: true, mobile: false, strength: 0.65, lo: 0.03, hi: 0.10 } },
   autoQuality: { sampleMs: 4000, minFps: 24, maxGapMs: 1000 },   // a longer render gap (hidden / covered) restarts the sample
   frameTimeoutMs: 600,           // no setFrame() for this long → fall back to live VideoTexture
   holo: {

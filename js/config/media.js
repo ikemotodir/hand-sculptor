@@ -8,7 +8,16 @@ export const MEDIA = {
     videoFrames: 'auto',    // 'auto' (VideoFrame if supported, else ImageBitmap) | 'bitmap' | 'none' (no frame returned)
     maxRebuilds: 4,         // detect errors → rebuild; after this many in a row → fatal error event
     worker: true,           // detection in tracker.worker.js (false → main thread; also ?worker=0)
-    workerInitMs: 45000,    // worker not ready within this → main thread
+    workerInitMs: 45000,    // worker not ready within this → next strategy (desktop)
+    workerInitMsMobile: 15000,   // … on phones/tablets (a stuck worker must not cost 45 s)
+    // self-healing chain (tracker-sync.js strategyPlan / HealthCheck): 'auto' = a (worker+VideoFrame) → b (worker+
+    // canvas ImageBitmap) → c (main thread, <video> direct); iOS/Safari start at b with the CPU delegate.
+    // Dev/tests: ?cfg.media.tracker.strategy=a|b|c forces the starting strategy.
+    strategy: 'auto',
+    // a strategy is HEALTHY when its first result arrives within firstMs (GPU compiles shaders first: 3–8 s measured),
+    // ≥ minResults results follow within windowMs of it, and lumSamples of them (taken ≥ lumAfterMs after arming)
+    // are not all black (mean grey < blackLum). Else → next strategy.
+    health: { windowMs: 4000, firstMs: { GPU: 12000, CPU: 6000 }, minResults: 3, lumSamples: 3, blackLum: 8, lumAfterMs: 500 },
     // adaptive frame mode (tracker-sync.js): results/s below liveBelow for liveAfterMs → 'delayed' (buffered video
     // shown ~latency late, hands interpolated); above syncAbove for syncAfterMs → 'sync'; ≥ minDwellMs between switches
     // ring copies stay full size up to 1920×1080 (12 × 8.3 MB fits ringBytes); only larger frames are downscaled (ringPlan)
@@ -28,6 +37,14 @@ export const MEDIA = {
     // … then raised to the camera's largest mode within maxLong × maxShort (its own aspect, no crop) while keeping
     // ≥ minFps (tracker.js upgradeCamera). Kept as it was when the camera cannot do more or the fps would drop.
     maxLong: 1920, maxShort: 1080, mobileMaxLong: 1920, mobileMaxShort: 1080, minFps: 24, upgrade: true,
+    // iOS/Safari: a mid-stream applyConstraints can freeze/blacken the feed → no upgrade there; the first request
+    // already asks the max (ideal 1920×1080 landscape / 1080×1920 portrait, aspect ideal) and the camera picks.
+    upgradeApple: false,
+    // camera-side picture controls, desktop only (tracker.js tuneCamera → tracker-sync.js cameraTune): applied ONCE after
+    // the start + upgradeCamera settled, never on iOS/Safari or phones/tablets (a mid-stream applyConstraints there can
+    // freeze/blacken the feed), never again mid-session. Values are fractions of the track's own capability range
+    // (owner's BisonCam: sharpness 0–20 → 0.4 = 8; it reported 4 at start). Cameras without the control are left alone.
+    tune: { sharpness: 0.4 },
     // lost camera (unplugged, OS toggle, driver reset): retry after restartDelayMs, then retryDelaysMs (the last one
     // repeats while the page is visible; also on visibilitychange / devicechange). The user is told once per outage.
     restartDelayMs: 600, retryDelaysMs: [1000, 2000, 4000, 5000], maxRestarts: 5, stableMs: 10000,
